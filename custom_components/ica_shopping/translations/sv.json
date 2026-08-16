@@ -10,8 +10,22 @@
   "issues": {
     "invalid_session_id": {
       "title": "Session ID är ogiltigt",
-      "description": "ICA-integrationen kan inte hämta data. Öppna integrationen och uppdatera session ID:t i konfigurationen.",
-      "severity": "error"
+      "description": "ICA-integrationen kan inte hämta data. Klicka på Åtgärda för att klistra in ett nytt session-ID utan att ta bort integrationen.",
+      "severity": "error",
+      "fix_flow": {
+        "abort": {
+          "entry_not_found": "ICA Shopping-konfigurationen finns inte längre."
+        },
+        "step": {
+          "confirm": {
+            "title": "Uppdatera ICA session-ID",
+            "description": "Logga in på ica.se i en webbläsare, kopiera värdet för cookien `thSessionId` och klistra in det nedan.",
+            "data": {
+              "session_id": "Session-ID"
+            }
+          }
+        }
+      }
     }
   },
   "remove_striked_both": {

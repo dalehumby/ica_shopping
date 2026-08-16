@@ -10,12 +10,13 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 class ICAApi:
-    def __init__(self, hass, session_id):
+    def __init__(self, hass, session_id, entry_id=None):
         self.hass = hass
         self.session_id = session_id
+        self.entry_id = entry_id
 
 
-            
+
     async def _get_token_from_session_id(self):
         headers = {
             "Cookie": f"thSessionId={self.session_id}",
@@ -35,8 +36,9 @@ class ICAApi:
                             "invalid_session_id",
                             is_fixable=True,
                             severity=ir.IssueSeverity.ERROR,
-                            translation_key="invalid_session_id"
-                        )   
+                            translation_key="invalid_session_id",
+                            data={"entry_id": self.entry_id},
+                        )
 
                         return None
 
@@ -154,7 +156,7 @@ class ICAApi:
             _LOGGER.error("❗ Fel vid borttagning av ICA-rad: %s", e)
             return False
 
-            
+
     async def add_to_list(self, list_id: str, text: str):
         token = await self._get_token_from_session_id()
         if not token:

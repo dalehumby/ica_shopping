@@ -1,6 +1,7 @@
+import logging
+
 from homeassistant.core import callback
-from homeassistant import config_entries
-from homeassistant.config_entries import ConfigFlow, OptionsFlow
+from homeassistant.config_entries import ConfigFlow, ConfigEntry, OptionsFlow
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import selector
 from homeassistant.helpers.selector import BooleanSelector
@@ -9,15 +10,17 @@ import voluptuous as vol
 from typing import Any
 from .const import DOMAIN
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class ICAConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
-    
+
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
-        return ICAOptionsFlowHandler(config_entry)
-    
+    def async_get_options_flow(config_entry: ConfigEntry) -> "ICAOptionsFlowHandler":
+        return ICAOptionsFlowHandler()
+
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
             return self.async_create_entry(
@@ -41,12 +44,14 @@ class ICAConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 class ICAOptionsFlowHandler(OptionsFlow):
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+    # Do not set self.config_entry here (or define __init__ at all) — modern
+    # Home Assistant core exposes config_entry as a read-only property that
+    # is only resolved once the flow manager has attached self.hass/self.handler.
+    # Assigning it manually raises AttributeError: property has no setter.
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         current_list_id = self.config_entry.options.get("ica_list_id", self.config_entry.data.get("ica_list_id", ""))
-        
+
         if user_input is not None:
             # Show warning only if list is changed
             new_list_id = user_input.get("ica_list_id", current_list_id)
@@ -74,5 +79,3 @@ class ICAOptionsFlowHandler(OptionsFlow):
                 "warning_text": "Changing the list may sync existing Keep items to a new ICA list. Make sure to clear or check the list first if needed."
             }
         )
-
-

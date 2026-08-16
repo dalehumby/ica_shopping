@@ -10,8 +10,22 @@
   "issues": {
     "invalid_session_id": {
       "title": "Session ID is invalid",
-      "description": "The ICA integration cannot fetch data. Open the integration and update the session ID in the configuration.",
-      "severity": "error"
+      "description": "The ICA integration cannot fetch data. Click Fix to paste a fresh session ID without removing the integration.",
+      "severity": "error",
+      "fix_flow": {
+        "abort": {
+          "entry_not_found": "The ICA Shopping config entry no longer exists."
+        },
+        "step": {
+          "confirm": {
+            "title": "Update the ICA session ID",
+            "description": "Log into ica.se in a browser, copy the `thSessionId` cookie value, and paste it below.",
+            "data": {
+              "session_id": "Session ID"
+            }
+          }
+        }
+      }
     }
   },
   "remove_striked_both": {

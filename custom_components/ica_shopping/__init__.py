@@ -42,7 +42,7 @@ async def async_setup_entry(hass, entry):
     _LOGGER.debug("⚙️ ICA Shopping initieras via UI config entry")
     session_id = entry.options.get("session_id", entry.data["session_id"])
     list_id = entry.options.get("ica_list_id", entry.data["ica_list_id"])
-    api = ICAApi(hass, session_id=session_id)
+    api = ICAApi(hass, session_id=session_id, entry_id=entry.entry_id)
     hass.data.setdefault(DOMAIN, {})[DATA_ICA] = api
     hass.data[DOMAIN]["current_list_id"] = list_id  # 🔁 spara aktuellt list ID
     keep_entity = entry.options.get("todo_entity_id", entry.data.get("todo_entity_id"))
