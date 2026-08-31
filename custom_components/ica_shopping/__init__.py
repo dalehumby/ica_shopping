@@ -165,7 +165,7 @@ async def async_setup_entry(hass, entry):
         debounce_unsub = async_call_later(hass, DEBOUNCE_SECONDS, schedule_sync)
 
 
-    hass.bus.async_listen("call_service", call_service_listener)
+    entry.async_on_unload(hass.bus.async_listen("call_service", call_service_listener))
 
     # --- Registrera refresh-tjänst ---
     async def handle_refresh(call):
@@ -311,6 +311,9 @@ async def async_setup_entry(hass, entry):
     entry.async_on_unload(entry.add_update_listener(_options_update_listener))
 
     return True
+
+async def async_unload_entry(hass, entry):
+    return await hass.config_entries.async_unload_platforms(entry, ["sensor"])
 
 async def _options_update_listener(hass, entry):
     _LOGGER.debug("♻️ Optioner har ändrats, laddar om entry")

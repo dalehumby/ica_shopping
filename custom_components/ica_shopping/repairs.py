@@ -30,7 +30,10 @@ class InvalidSessionIdRepairFlow(RepairsFlow):
                 entry,
                 options={**entry.options, "session_id": user_input["session_id"]},
             )
-            await self.hass.config_entries.async_reload(entry_id)
+            # async_update_entry above already triggers the entry's own
+            # update listener (_options_update_listener in __init__.py),
+            # which reloads the entry — an explicit reload here would race
+            # a second, redundant reload against that one.
             return self.async_create_entry(data={})
 
         return self.async_show_form(
