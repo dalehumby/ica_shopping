@@ -44,7 +44,29 @@ class ICAApi:
 
                     data = await resp.json()
                     token = data.get("accessToken")
+                    login_state = data.get("loginState", 0)
 
+                    if not token or not login_state:
+                        # ICA returns HTTP 200 with a public/anonymous accessToken
+                        # even when thSessionId has expired (loginState: 0) — the
+                        # cookie exchange itself never fails, only the later
+                        # shopping-list API calls made with that anonymous token do.
+                        _LOGGER.error(
+                            "❗ ICA-sessionen är ogiltig (loginState=%s) – endast en publik token tillgänglig",
+                            login_state,
+                        )
+
+                        ir.async_create_issue(
+                            self.hass,
+                            DOMAIN,
+                            "invalid_session_id",
+                            is_fixable=True,
+                            severity=ir.IssueSeverity.ERROR,
+                            translation_key="invalid_session_id",
+                            data={"entry_id": self.entry_id},
+                        )
+
+                        return None
 
                     # Ta bort eventuell aktiv issue om sessionen funkar igen
 
