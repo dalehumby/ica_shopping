@@ -175,6 +175,16 @@ async def async_setup_entry(hass, entry):
             remove_striked = entry.options.get("remove_striked", True)
             keep_entity = entry.options.get("todo_entity_id", entry.data.get("todo_entity_id"))
             list_id = entry.options.get("ica_list_id", entry.data.get("ica_list_id"))
+
+            # Baseline of items we last confirmed were actually in ICA. Used
+            # below to tell "removed in ICA" (was in baseline, now gone) apart
+            # from "added in Keep but never synced yet" (never in baseline) —
+            # e.g. added while the session token was expired. Without this,
+            # any Keep item not yet mirrored to ICA looks identical to one
+            # that was deleted in the ICA app, and gets wiped from Keep too.
+            baseline_store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{entry.entry_id}_{list_id}")
+            known_ica_items = set(await baseline_store.async_load() or [])
+
             lists = await api.fetch_lists()
             the_list = next((l for l in lists if l.get("id") == list_id), None)
             if not the_list:
@@ -265,10 +275,32 @@ async def async_setup_entry(hass, entry):
                 )
                 _LOGGER.info("✅ Lagt till '%s' i Keep", item)
 
-            # Ta bort från Keep det som inte finns i ICA
+            # 3️⃣ Lägg till i ICA det som finns aktivt i Keep men saknas i ICA
+            # (t.ex. varor tillagda i Keep medan sessionen var utgången, som
+            # den vanliga debounce-synken aldrig lyckades pusha vidare).
+            to_push_to_ica = [
+                s for s in keep_summaries
+                if s.strip().lower() not in keep_completed
+                and s.strip().lower() not in ica_items_lower
+                and s.strip().lower() not in recent_removes
+            ]
+            space = MAX_ICA_ITEMS - len(rows)
+            to_push_to_ica = to_push_to_ica[:max(space, 0)]
+
+            for text in to_push_to_ica:
+                success = await api.add_to_list(list_id, text)
+                if success:
+                    _LOGGER.info("📤 (refresh) Lade till '%s' i ICA", text)
+
+            # Ta bort från Keep det som inte finns i ICA – men bara om vi
+            # tidigare bekräftat att varan faktiskt fanns i ICA (known_ica_items).
+            # Annars kan en vara som lagts till i Keep men ännu inte hunnit
+            # synkas till ICA (t.ex. under en utgången session) felaktigt tolkas
+            # som borttagen i ICA och raderas ur Keep. Vid osäkerhet: behåll.
             to_remove_from_keep = [
                 i.get("summary") for i in keep_items
                 if i.get("summary", "").strip().lower() not in ica_items_lower
+                and i.get("summary", "").strip().lower() in known_ica_items
             ]
 
             for summary in to_remove_from_keep:
@@ -290,6 +322,19 @@ async def async_setup_entry(hass, entry):
 
             # Uppdatera sensor
             await _trigger_sensor_update(hass, list_id)
+
+            # Spara ny baseline: hämta det faktiska ICA-läget efter alla
+            # ändringar ovan, så nästa refresh kan skilja på en riktig
+            # borttagning i ICA och en vara som bara inte synkats än.
+            final_lists = await api.fetch_lists()
+            final_list = next((l for l in final_lists if l.get("id") == list_id), None)
+            if final_list:
+                final_ica_set = {
+                    r.get("text", "").strip().lower()
+                    for r in final_list.get("rows", [])
+                    if isinstance(r, dict)
+                }
+                await baseline_store.async_save(list(final_ica_set))
 
             # Rensa eventspårning efter allt är klart
             if "recent_keep_adds" in hass.data[DOMAIN]:
