@@ -278,11 +278,16 @@ async def async_setup_entry(hass, entry):
             # 3️⃣ Lägg till i ICA det som finns aktivt i Keep men saknas i ICA
             # (t.ex. varor tillagda i Keep medan sessionen var utgången, som
             # den vanliga debounce-synken aldrig lyckades pusha vidare).
+            # known_ica_items utesluts här: om varan tidigare bekräftats finnas
+            # i ICA och nu saknas betyder det att den bockats av/tagits bort i
+            # ICA (t.ex. skannad i kassan) – då ska den INTE återskapas i ICA,
+            # bara tas bort ur Keep (se to_remove_from_keep nedan).
             to_push_to_ica = [
                 s for s in keep_summaries
                 if s.strip().lower() not in keep_completed
                 and s.strip().lower() not in ica_items_lower
                 and s.strip().lower() not in recent_removes
+                and s.strip().lower() not in known_ica_items
             ]
             space = MAX_ICA_ITEMS - len(rows)
             to_push_to_ica = to_push_to_ica[:max(space, 0)]
