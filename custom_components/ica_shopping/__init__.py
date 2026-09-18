@@ -70,7 +70,15 @@ async def async_setup_entry(hass, entry):
             )
 
             items = result.get(keep_entity, {}).get("items", [])
-            summaries = [i.get("summary", "").strip() for i in items if isinstance(i, dict)]
+            # Bockade/completed varor ska inte skickas till ICA igen. Annars
+            # återuppstår en vara som just tagits bort i ICA (skannad i
+            # kassan, eller bockad i Keep) så fort något annat i listan
+            # ändras och den här debounce-synken triggas på nytt.
+            summaries = [
+                i.get("summary", "").strip()
+                for i in items
+                if isinstance(i, dict) and i.get("status") != "completed"
+            ]
             if len(summaries) > MAX_KEEP_ITEMS:
                 summaries = summaries[:MAX_KEEP_ITEMS]
 
@@ -223,21 +231,31 @@ async def async_setup_entry(hass, entry):
 
 
             # 1️⃣ Hitta completed-items i Keep som fortfarande finns i ICA
+            keep_completed_items = [i for i in keep_items if i.get("status") == "completed"]
             keep_completed = [
-                i.get("summary", "").strip().lower()
-                for i in keep_items
-                if i.get("status") == "completed"
+                i.get("summary", "").strip().lower() for i in keep_completed_items
             ]
 
 
             # ❌ Radera completed från Keep – endast om remove_striked är aktivt
+            # Tar bort via uid (inte den gemena texten) eftersom todo.remove_item
+            # matchar exakt – en vara med versal (t.ex. "Bucket") matchade
+            # aldrig den gemena texten och blev därför ALDRIG borttagen, vilket
+            # fick den att dyka upp igen varje gång debounce-synken kördes.
             if remove_striked:
-                for text in keep_completed:
+                for i in keep_completed_items:
+                    target = i.get("uid") or i.get("summary", "").strip()
+                    if not target:
+                        continue
                     await hass.services.async_call(
                         "todo", "remove_item",
-                        {"entity_id": keep_entity, "item": text}
+                        {"entity_id": keep_entity, "item": target},
+                        blocking=True,
                     )
-                    _LOGGER.info("🧹 Tog bort '%s' från Keep (pga status: completed + remove_striked)", text)
+                    _LOGGER.info(
+                        "🧹 Tog bort '%s' från Keep (pga status: completed + remove_striked)",
+                        i.get("summary", ""),
+                    )
 
 
             # 2️⃣ Lägg till dem i listan att radera från ICA
@@ -303,18 +321,20 @@ async def async_setup_entry(hass, entry):
             # synkas till ICA (t.ex. under en utgången session) felaktigt tolkas
             # som borttagen i ICA och raderas ur Keep. Vid osäkerhet: behåll.
             to_remove_from_keep = [
-                i.get("summary") for i in keep_items
+                i for i in keep_items
                 if i.get("summary", "").strip().lower() not in ica_items_lower
                 and i.get("summary", "").strip().lower() in known_ica_items
             ]
 
-            for summary in to_remove_from_keep:
-                if summary:
+            for i in to_remove_from_keep:
+                target = i.get("uid") or i.get("summary", "").strip()
+                if target:
                     await hass.services.async_call(
                         "todo", "remove_item",
-                        {"entity_id": keep_entity, "item": summary}
+                        {"entity_id": keep_entity, "item": target},
+                        blocking=True,
                     )
-                    _LOGGER.info("🗑️ Tagit bort '%s' från Keep", summary)
+                    _LOGGER.info("🗑️ Tagit bort '%s' från Keep", i.get("summary", ""))
 
             # Ta bort från ICA om det just tagits bort i Keep
             to_remove_from_ica = [item for item in recent_removes if item in ica_rows_dict]
