@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from homeassistant.core import callback
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.event import async_call_later
 from .const import DOMAIN, DATA_ICA
@@ -50,13 +52,26 @@ async def async_setup_entry(hass, entry):
         _LOGGER.error("❌ Ingen todo-entity vald – ICA-integrationen kan inte synka utan en källa.")
         return False
 
- 
+    # Serialises every read-modify-write against ICA/Keep (debounced push,
+    # refresh, direct removal). Without it, overlapping runs each saw an item
+    # as missing from ICA and each added it, multiplying duplicate rows; and a
+    # push could run mid-refresh, re-adding an item the refresh had just
+    # removed from ICA but not yet from Keep.
+    sync_lock = asyncio.Lock()
+
+    def _baseline_store(list_id):
+        return Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{entry.entry_id}_{list_id}")
+
     # --- Keep → ICA debounce sync ---
     debounce_unsub = None
 
     async def schedule_sync(_now=None):
         nonlocal debounce_unsub
         debounce_unsub = None
+        async with sync_lock:
+            await _sync_keep_to_ica()
+
+    async def _sync_keep_to_ica():
         list_id = entry.options.get("ica_list_id", entry.data.get("ica_list_id"))
         keep_entity = entry.options.get("todo_entity_id", entry.data.get("todo_entity_id"))
 
@@ -88,24 +103,48 @@ async def async_setup_entry(hass, entry):
                 _LOGGER.error("🚫 ICA-listan full (%s). Inga varor tillagda.", len(rows))
                 return
 
-            existing = [r.get("text", "").strip().lower() for r in rows if isinstance(r, dict)]
+            baseline_store = _baseline_store(list_id)
+            known_ica_items = set(await baseline_store.async_load() or [])
+
+            # Skip anything already in ICA, anything already queued in this
+            # pass (Keep can hold the same text twice), and anything the
+            # baseline says was in ICA but is gone now — that was removed in
+            # ICA (e.g. scanned at the checkout) and refresh will drop it from
+            # Keep; pushing it here would resurrect it.
+            seen = {r.get("text", "").strip().lower() for r in rows if isinstance(r, dict)}
+            to_add = []
+            for s in summaries:
+                key = s.lower()
+                if key in seen or key in known_ica_items:
+                    continue
+                seen.add(key)
+                to_add.append(s)
             space = MAX_ICA_ITEMS - len(rows)
-            to_add = [s for s in summaries if s.lower() not in existing][:space]
-            
-            any_added = False
+            to_add = to_add[:space]
+
+            added = set()
             for text in to_add:
                 success = await api.add_to_list(list_id, text)
                 if success:
                     _LOGGER.info("📥 Lade till '%s' i ICA", text)
-                    any_added = True
+                    added.add(text.lower())
 
-            if any_added:
+            if added:
+                # Record pushed items in the baseline straight away, so if one
+                # is struck off in ICA before the next refresh, refresh sees it
+                # as removed in ICA rather than as never synced (which pushed
+                # it straight back into ICA).
+                await baseline_store.async_save(sorted(known_ica_items | added))
                 await _trigger_sensor_update(hass, list_id)
                     
                     
         except Exception as e:
             _LOGGER.error("💥 Fel vid sync_keep_to_ica: %s", e)
 
+    # Must be a callback: a plain function bus listener is run in an executor
+    # thread, where hass.async_create_task raised and the direct ICA removal
+    # below never ran.
+    @callback
     def call_service_listener(event):
         nonlocal debounce_unsub
         data = event.data.get("service_data", {})
@@ -120,7 +159,14 @@ async def async_setup_entry(hass, entry):
                 _LOGGER.debug("🟡 Avlyssnad remove via update_item: %s", item)
 
                 # 🆕 Direktborttagning från ICA
-                async def remove_from_ica_direct():
+                # item is passed in, not read from the closure: the code below
+                # reassigns item (to the uid) before this task gets to run, so
+                # the lookup never matched an ICA row.
+                async def remove_from_ica_direct(item):
+                    async with sync_lock:
+                        await _remove_from_ica_direct(item)
+
+                async def _remove_from_ica_direct(item):
                     try:
                         list_id = entry.options.get("ica_list_id", entry.data.get("ica_list_id"))
                         lists = await api.fetch_lists()
@@ -136,7 +182,7 @@ async def async_setup_entry(hass, entry):
                     except Exception as e:
                         _LOGGER.error("💥 Fel vid direkt ICA-radering: %s", e)
 
-                hass.async_create_task(remove_from_ica_direct())
+                hass.async_create_task(remove_from_ica_direct(item))
 
                 # Planera även en sync mot Keep
                 if debounce_unsub:
@@ -177,6 +223,10 @@ async def async_setup_entry(hass, entry):
 
     # --- Registrera refresh-tjänst ---
     async def handle_refresh(call):
+        async with sync_lock:
+            await _refresh()
+
+    async def _refresh():
 
         _LOGGER.debug("🔄 ICA refresh triggered via service")
         try:
@@ -190,7 +240,7 @@ async def async_setup_entry(hass, entry):
             # e.g. added while the session token was expired. Without this,
             # any Keep item not yet mirrored to ICA looks identical to one
             # that was deleted in the ICA app, and gets wiped from Keep too.
-            baseline_store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{entry.entry_id}_{list_id}")
+            baseline_store = _baseline_store(list_id)
             known_ica_items = set(await baseline_store.async_load() or [])
 
             lists = await api.fetch_lists()
@@ -200,6 +250,7 @@ async def async_setup_entry(hass, entry):
                 return
                 
             rows = the_list.get("rows", [])
+            struck_texts = set()
 
             if remove_striked:
                 checked_rows = [r for r in rows if r.get("isStriked") is True and r.get("id")]
@@ -207,7 +258,8 @@ async def async_setup_entry(hass, entry):
                     await api.remove_item(r["id"])
                     _LOGGER.info("🧹 Rensade avbockad vara '%s' från ICA", r.get("text", ""))
                 rows = [r for r in rows if r.get("id") not in [cr["id"] for cr in checked_rows]]
-            
+                struck_texts = {r.get("text", "").strip().lower() for r in checked_rows}
+
             
             if len(rows) >= MAX_ICA_ITEMS:
                 _LOGGER.error("🚫 ICA-listan är full (%s varor). Refresh stoppad.", len(rows))
@@ -219,6 +271,11 @@ async def async_setup_entry(hass, entry):
                 row.get("text", "").strip().lower(): row.get("id")
                 for row in rows if isinstance(row, dict)
             }
+            # Struck off in ICA (scanned at the checkout) this run and no other
+            # copy left. These are removed in ICA even if the baseline never
+            # recorded them (e.g. added to Keep since the last refresh) — that
+            # gap is what pushed scanned items straight back into ICA.
+            removed_in_ica = struck_texts - set(ica_items_lower)
 
             result = await hass.services.async_call(
                 "todo", "get_items",
@@ -247,15 +304,11 @@ async def async_setup_entry(hass, entry):
                     target = i.get("uid") or i.get("summary", "").strip()
                     if not target:
                         continue
-                    await hass.services.async_call(
-                        "todo", "remove_item",
-                        {"entity_id": keep_entity, "item": target},
-                        blocking=True,
-                    )
-                    _LOGGER.info(
-                        "🧹 Tog bort '%s' från Keep (pga status: completed + remove_striked)",
-                        i.get("summary", ""),
-                    )
+                    if await _remove_from_keep(keep_entity, target):
+                        _LOGGER.info(
+                            "🧹 Tog bort '%s' från Keep (pga status: completed + remove_striked)",
+                            i.get("summary", ""),
+                        )
 
 
             # 2️⃣ Lägg till dem i listan att radera från ICA
@@ -273,12 +326,15 @@ async def async_setup_entry(hass, entry):
             recent_removes = hass.data[DOMAIN].setdefault("recent_keep_removes", set())
 
             # Lägg till i Keep det som saknas i Keep, och som INTE nyss tagits bort
+            # Deduplicated: duplicate ICA rows used to each add their own Keep
+            # item, which the push then mirrored back as more ICA rows.
             to_add = []
             for item in ica_items:
                 key = item.lower()
                 if key not in keep_lower and key not in recent_removes:
                     _LOGGER.debug("➕ Planerar att lägga till i Keep: %s", item)
                     to_add.append(item)
+                    keep_lower.append(key)
                 else:
                     _LOGGER.debug("⛔ Hoppar över '%s' – finns i recent_removes eller redan i Keep", item)
 
@@ -300,13 +356,20 @@ async def async_setup_entry(hass, entry):
             # i ICA och nu saknas betyder det att den bockats av/tagits bort i
             # ICA (t.ex. skannad i kassan) – då ska den INTE återskapas i ICA,
             # bara tas bort ur Keep (se to_remove_from_keep nedan).
-            to_push_to_ica = [
-                s for s in keep_summaries
-                if s.strip().lower() not in keep_completed
-                and s.strip().lower() not in ica_items_lower
-                and s.strip().lower() not in recent_removes
-                and s.strip().lower() not in known_ica_items
-            ]
+            to_push_to_ica = []
+            queued = set()
+            for s in keep_summaries:
+                key = s.strip().lower()
+                if (
+                    key not in keep_completed
+                    and key not in ica_items_lower
+                    and key not in recent_removes
+                    and key not in known_ica_items
+                    and key not in removed_in_ica
+                    and key not in queued
+                ):
+                    queued.add(key)
+                    to_push_to_ica.append(s)
             space = MAX_ICA_ITEMS - len(rows)
             to_push_to_ica = to_push_to_ica[:max(space, 0)]
 
@@ -323,17 +386,15 @@ async def async_setup_entry(hass, entry):
             to_remove_from_keep = [
                 i for i in keep_items
                 if i.get("summary", "").strip().lower() not in ica_items_lower
-                and i.get("summary", "").strip().lower() in known_ica_items
+                and (
+                    i.get("summary", "").strip().lower() in known_ica_items
+                    or i.get("summary", "").strip().lower() in removed_in_ica
+                )
             ]
 
             for i in to_remove_from_keep:
                 target = i.get("uid") or i.get("summary", "").strip()
-                if target:
-                    await hass.services.async_call(
-                        "todo", "remove_item",
-                        {"entity_id": keep_entity, "item": target},
-                        blocking=True,
-                    )
+                if target and await _remove_from_keep(keep_entity, target):
                     _LOGGER.info("🗑️ Tagit bort '%s' från Keep", i.get("summary", ""))
 
             # Ta bort från ICA om det just tagits bort i Keep
@@ -371,6 +432,20 @@ async def async_setup_entry(hass, entry):
         except Exception as e:
             _LOGGER.error("💥 Fel vid refresh: %s", e)
 
+
+    async def _remove_from_keep(keep_entity, target):
+        # One item already gone from Keep (e.g. removed by Keep's own sync)
+        # used to abort the whole refresh, skipping the baseline save.
+        try:
+            await hass.services.async_call(
+                "todo", "remove_item",
+                {"entity_id": keep_entity, "item": target},
+                blocking=True,
+            )
+            return True
+        except Exception as e:
+            _LOGGER.warning("⚠️ Kunde inte ta bort '%s' från Keep: %s", target, e)
+            return False
 
     hass.services.async_register(DOMAIN, "refresh", handle_refresh)
 
