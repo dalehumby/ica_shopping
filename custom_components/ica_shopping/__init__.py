@@ -1,474 +1,408 @@
+"""ICA Shopping: mirror a to-do list (e.g. Google Keep) into an ICA shopping list.
+
+The to-do list is the source of truth: items are added, read and corrected
+there (voice, Nest Hub, the HA app). The ICA list is a copy of its open items
+for the self-checkout scanner. The only thing read back from ICA is that a row
+was struck off (scanned) or deleted, which means bought: the to-do item is
+removed.
+
+To-do items and ICA rows are linked by ID (to-do uid -> ICA row id) and the
+links are persisted, so duplicate names, renames and letter case never confuse
+the sync. Every change, whatever triggered it, goes through one reconcile pass
+under one lock.
+"""
+
 import asyncio
 import logging
-from homeassistant.core import callback
-from homeassistant.helpers.storage import Store
-from homeassistant.helpers.event import async_call_later
-from .const import DOMAIN, DATA_ICA
-from homeassistant.helpers import entity_registry
+import time
+from collections import defaultdict
+from datetime import timedelta
 
-from .ica_api import ICAApi
+from homeassistant.components.todo import TodoItemStatus
+from homeassistant.components.todo.const import DATA_COMPONENT as TODO_DATA_COMPONENT
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_state_change_event,
+    async_track_time_interval,
+)
+from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.storage import Store
+
+from .const import DOMAIN, signal_list_updated
+from .ica_api import ICAApi, ICAError
 
 _LOGGER = logging.getLogger(__name__)
 
-async def _trigger_sensor_update(hass, list_id):
-    registry = entity_registry.async_get(hass)  # ✅ utan await
-    target_unique_id = f"shoppinglist_{list_id}"
-    sensor_entity = None
-
-    for entity in registry.entities.values():
-        if entity.unique_id == target_unique_id:
-            sensor_entity = entity.entity_id
-            break
-
-    if not sensor_entity:
-        _LOGGER.debug("ℹ️ Kunde inte hitta sensor med unique_id %s", target_unique_id)
-        return
-
-    _LOGGER.debug("🔁 Triggar update för %s", sensor_entity)
-    await hass.services.async_call(
-        "homeassistant", "update_entity",
-        {"entity_id": sensor_entity},
-        blocking=True
-    )
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+PLATFORMS = ["sensor"]
 
 STORAGE_VERSION = 1
-STORAGE_KEY = "ica_keep_synced_list"
-MAX_ICA_ITEMS = 250
-MAX_KEEP_ITEMS = 100
+LINKS_STORAGE_KEY = "ica_shopping_links"
+OLD_BASELINE_STORAGE_KEY = "ica_keep_synced_list"
 DEBOUNCE_SECONDS = 1
+SYNC_INTERVAL = timedelta(minutes=10)
+MAX_ICA_ROWS = 250
+WIPE_GUARD_MIN_LINKS = 3
+# An ICA row adopted into the to-do list is linked when its new to-do item
+# shows up; if it never does (the to-do write failed), adopt it again.
+PENDING_ADOPTION_TIMEOUT = 60 * 60
 
-async def async_setup(hass, config):
+
+async def async_setup(hass: HomeAssistant, config) -> bool:
+    async def async_handle_refresh(call: ServiceCall) -> None:
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            # Registered here rather than per entry so that a disabled or
+            # failed integration is an explicit error, not an unknown action
+            # that only appears after the next restart.
+            raise HomeAssistantError("ICA Shopping is not loaded (disabled or failed to set up)")
+        for entry in entries:
+            await entry.runtime_data.async_reconcile(raise_errors=True)
+
+    hass.services.async_register(DOMAIN, "refresh", async_handle_refresh)
     return True
 
-async def async_setup_entry(hass, entry):
-    _LOGGER.debug("⚙️ ICA Shopping initieras via UI config entry")
-    session_id = entry.options.get("session_id", entry.data["session_id"])
-    list_id = entry.options.get("ica_list_id", entry.data["ica_list_id"])
-    api = ICAApi(hass, session_id=session_id, entry_id=entry.entry_id)
-    hass.data.setdefault(DOMAIN, {})[DATA_ICA] = api
-    hass.data[DOMAIN]["current_list_id"] = list_id  # 🔁 spara aktuellt list ID
-    keep_entity = entry.options.get("todo_entity_id", entry.data.get("todo_entity_id"))
-    if not keep_entity:
-        _LOGGER.error("❌ Ingen todo-entity vald – ICA-integrationen kan inte synka utan en källa.")
+
+async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
+    keep_entity_id = entry.options.get("todo_entity_id", entry.data.get("todo_entity_id"))
+    if not keep_entity_id:
+        _LOGGER.error("No to-do entity configured; ICA Shopping has nothing to sync from")
         return False
 
-    # Serialises every read-modify-write against ICA/Keep (debounced push,
-    # refresh, direct removal). Without it, overlapping runs each saw an item
-    # as missing from ICA and each added it, multiplying duplicate rows; and a
-    # push could run mid-refresh, re-adding an item the refresh had just
-    # removed from ICA but not yet from Keep.
-    sync_lock = asyncio.Lock()
+    session_id = entry.options.get("session_id", entry.data["session_id"])
+    api = ICAApi(hass, session_id=session_id, entry_id=entry.entry_id)
+    sync = ICASync(hass, entry, api, keep_entity_id)
+    entry.runtime_data = sync
 
-    def _baseline_store(list_id):
-        return Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{entry.entry_id}_{list_id}")
-
-    # --- Keep → ICA debounce sync ---
-    debounce_unsub = None
-
-    async def schedule_sync(_now=None):
-        nonlocal debounce_unsub
-        debounce_unsub = None
-        async with sync_lock:
-            await _sync_keep_to_ica()
-
-    async def _sync_keep_to_ica():
-        list_id = entry.options.get("ica_list_id", entry.data.get("ica_list_id"))
-        keep_entity = entry.options.get("todo_entity_id", entry.data.get("todo_entity_id"))
-
-
-        _LOGGER.debug("🔁 Debounced Keep → ICA sync")
-        try:
-            result = await hass.services.async_call(
-                "todo", "get_items",
-                {"entity_id": keep_entity},
-                blocking=True, return_response=True
-            )
-
-            items = result.get(keep_entity, {}).get("items", [])
-            # Bockade/completed varor ska inte skickas till ICA igen. Annars
-            # återuppstår en vara som just tagits bort i ICA (skannad i
-            # kassan, eller bockad i Keep) så fort något annat i listan
-            # ändras och den här debounce-synken triggas på nytt.
-            summaries = [
-                i.get("summary", "").strip()
-                for i in items
-                if isinstance(i, dict) and i.get("status") != "completed"
-            ]
-            if len(summaries) > MAX_KEEP_ITEMS:
-                summaries = summaries[:MAX_KEEP_ITEMS]
-
-            lists = await api.fetch_lists()
-            rows = next((l.get("rows", []) for l in lists if l.get("id") == list_id), [])
-            if len(rows) >= MAX_ICA_ITEMS:
-                _LOGGER.error("🚫 ICA-listan full (%s). Inga varor tillagda.", len(rows))
-                return
-
-            baseline_store = _baseline_store(list_id)
-            known_ica_items = set(await baseline_store.async_load() or [])
-
-            # Skip anything already in ICA, anything already queued in this
-            # pass (Keep can hold the same text twice), and anything the
-            # baseline says was in ICA but is gone now — that was removed in
-            # ICA (e.g. scanned at the checkout) and refresh will drop it from
-            # Keep; pushing it here would resurrect it.
-            seen = {r.get("text", "").strip().lower() for r in rows if isinstance(r, dict)}
-            to_add = []
-            for s in summaries:
-                key = s.lower()
-                if key in seen or key in known_ica_items:
-                    continue
-                seen.add(key)
-                to_add.append(s)
-            space = MAX_ICA_ITEMS - len(rows)
-            to_add = to_add[:space]
-
-            added = set()
-            for text in to_add:
-                success = await api.add_to_list(list_id, text)
-                if success:
-                    _LOGGER.info("📥 Lade till '%s' i ICA", text)
-                    added.add(text.lower())
-
-            if added:
-                # Record pushed items in the baseline straight away, so if one
-                # is struck off in ICA before the next refresh, refresh sees it
-                # as removed in ICA rather than as never synced (which pushed
-                # it straight back into ICA).
-                await baseline_store.async_save(sorted(known_ica_items | added))
-                await _trigger_sensor_update(hass, list_id)
-                    
-                    
-        except Exception as e:
-            _LOGGER.error("💥 Fel vid sync_keep_to_ica: %s", e)
-
-    # Must be a callback: a plain function bus listener is run in an executor
-    # thread, where hass.async_create_task raised and the direct ICA removal
-    # below never ran.
-    @callback
-    def call_service_listener(event):
-        nonlocal debounce_unsub
-        data = event.data.get("service_data", {})
-        service = event.data.get("service")
-        # Lyssna på "status: completed" via update_item
-        if service == "update_item":
-            status = data.get("status")
-            text = data.get("rename")  # detta är varunamnet
-            if status == "completed" and text:
-                item = text.strip().lower()
-                hass.data[DOMAIN].setdefault("recent_keep_removes", set()).add(item)
-                _LOGGER.debug("🟡 Avlyssnad remove via update_item: %s", item)
-
-                # 🆕 Direktborttagning från ICA
-                # item is passed in, not read from the closure: the code below
-                # reassigns item (to the uid) before this task gets to run, so
-                # the lookup never matched an ICA row.
-                async def remove_from_ica_direct(item):
-                    async with sync_lock:
-                        await _remove_from_ica_direct(item)
-
-                async def _remove_from_ica_direct(item):
-                    try:
-                        list_id = entry.options.get("ica_list_id", entry.data.get("ica_list_id"))
-                        lists = await api.fetch_lists()
-                        rows = next((l.get("rows", []) for l in lists if l.get("id") == list_id), [])
-                        ica_rows_dict = {
-                            row.get("text", "").strip().lower(): row.get("id")
-                            for row in rows if isinstance(row, dict)
-                        }
-                        row_id = ica_rows_dict.get(item)
-                        if row_id:
-                            await api.remove_item(row_id)
-                            _LOGGER.info("❌ Direkt borttagning av '%s' från ICA (pga completed i Keep)", item)
-                    except Exception as e:
-                        _LOGGER.error("💥 Fel vid direkt ICA-radering: %s", e)
-
-                hass.async_create_task(remove_from_ica_direct(item))
-
-                # Planera även en sync mot Keep
-                if debounce_unsub:
-                    debounce_unsub()
-                debounce_unsub = async_call_later(hass, DEBOUNCE_SECONDS, schedule_sync)
-      
-        entity_ids = data.get("entity_id", [])
-        keep_entity = entry.options.get("todo_entity_id", entry.data.get("todo_entity_id"))
-        item = data.get("item")
-        if isinstance(item, str):
-            item = item.strip().lower()
-        elif isinstance(item, list) and item:   
-            item = item[0].strip().lower()  # plockar första om flera finns
-        else:
-            item = None
-
-        if isinstance(entity_ids, str):
-            entity_ids = [entity_ids]
-
-        if keep_entity not in entity_ids or not item:
-            return
-
-        # Spåra senaste add/remove från Keep
-        if service == "add_item":
-            hass.data[DOMAIN].setdefault("recent_keep_adds", set()).add(item)
-            _LOGGER.debug("📌 Noterat 'add_item' i Keep: %s", item)
-
-        elif service == "remove_item":
-            hass.data[DOMAIN].setdefault("recent_keep_removes", set()).add(item)
-            _LOGGER.debug("📌 Noterat 'remove_item' i Keep: %s", item)
-
-        if debounce_unsub:
-            debounce_unsub()
-        debounce_unsub = async_call_later(hass, DEBOUNCE_SECONDS, schedule_sync)
-
-
-    entry.async_on_unload(hass.bus.async_listen("call_service", call_service_listener))
-
-    # --- Registrera refresh-tjänst ---
-    async def handle_refresh(call):
-        async with sync_lock:
-            await _refresh()
-
-    async def _refresh():
-
-        _LOGGER.debug("🔄 ICA refresh triggered via service")
-        try:
-            remove_striked = entry.options.get("remove_striked", True)
-            keep_entity = entry.options.get("todo_entity_id", entry.data.get("todo_entity_id"))
-            list_id = entry.options.get("ica_list_id", entry.data.get("ica_list_id"))
-
-            # Baseline of items we last confirmed were actually in ICA. Used
-            # below to tell "removed in ICA" (was in baseline, now gone) apart
-            # from "added in Keep but never synced yet" (never in baseline) —
-            # e.g. added while the session token was expired. Without this,
-            # any Keep item not yet mirrored to ICA looks identical to one
-            # that was deleted in the ICA app, and gets wiped from Keep too.
-            baseline_store = _baseline_store(list_id)
-            known_ica_items = set(await baseline_store.async_load() or [])
-
-            lists = await api.fetch_lists()
-            the_list = next((l for l in lists if l.get("id") == list_id), None)
-            if not the_list:
-                _LOGGER.warning("❌ Kunde inte hitta ICA-lista %s", list_id)
-                return
-                
-            rows = the_list.get("rows", [])
-            struck_texts = set()
-
-            if remove_striked:
-                checked_rows = [r for r in rows if r.get("isStriked") is True and r.get("id")]
-                for r in checked_rows:
-                    await api.remove_item(r["id"])
-                    _LOGGER.info("🧹 Rensade avbockad vara '%s' från ICA", r.get("text", ""))
-                rows = [r for r in rows if r.get("id") not in [cr["id"] for cr in checked_rows]]
-                struck_texts = {r.get("text", "").strip().lower() for r in checked_rows}
-
-            
-            if len(rows) >= MAX_ICA_ITEMS:
-                _LOGGER.error("🚫 ICA-listan är full (%s varor). Refresh stoppad.", len(rows))
-                return
-
-            ica_items = [row.get("text", "").strip() for row in rows if isinstance(row, dict)]
-            ica_items_lower = [x.lower() for x in ica_items]
-            ica_rows_dict = {
-                row.get("text", "").strip().lower(): row.get("id")
-                for row in rows if isinstance(row, dict)
-            }
-            # Struck off in ICA (scanned at the checkout) this run and no other
-            # copy left. These are removed in ICA even if the baseline never
-            # recorded them (e.g. added to Keep since the last refresh) — that
-            # gap is what pushed scanned items straight back into ICA.
-            removed_in_ica = struck_texts - set(ica_items_lower)
-
-            result = await hass.services.async_call(
-                "todo", "get_items",
-                {"entity_id": keep_entity},
-                blocking=True, return_response=True
-            )
-            keep_items = result.get(keep_entity, {}).get("items", [])
-            keep_summaries = [i.get("summary", "").strip() for i in keep_items if isinstance(i, dict)]
-            keep_lower = [x.lower() for x in keep_summaries]
-
-
-            # 1️⃣ Hitta completed-items i Keep som fortfarande finns i ICA
-            keep_completed_items = [i for i in keep_items if i.get("status") == "completed"]
-            keep_completed = [
-                i.get("summary", "").strip().lower() for i in keep_completed_items
-            ]
-
-
-            # ❌ Radera completed från Keep – endast om remove_striked är aktivt
-            # Tar bort via uid (inte den gemena texten) eftersom todo.remove_item
-            # matchar exakt – en vara med versal (t.ex. "Bucket") matchade
-            # aldrig den gemena texten och blev därför ALDRIG borttagen, vilket
-            # fick den att dyka upp igen varje gång debounce-synken kördes.
-            if remove_striked:
-                for i in keep_completed_items:
-                    target = i.get("uid") or i.get("summary", "").strip()
-                    if not target:
-                        continue
-                    if await _remove_from_keep(keep_entity, target):
-                        _LOGGER.info(
-                            "🧹 Tog bort '%s' från Keep (pga status: completed + remove_striked)",
-                            i.get("summary", ""),
-                        )
-
-
-            # 2️⃣ Lägg till dem i listan att radera från ICA
-            for text in keep_completed:
-                row_id = ica_rows_dict.get(text)
-                if row_id:
-                    await api.remove_item(row_id)
-                    _LOGGER.info("❌ Tog bort '%s' från ICA (baserat på Keep: completed)", text)
-
-
-
-
-            # Hämta senaste ändringar från Keep
-            recent_adds = hass.data[DOMAIN].setdefault("recent_keep_adds", set())
-            recent_removes = hass.data[DOMAIN].setdefault("recent_keep_removes", set())
-
-            # Lägg till i Keep det som saknas i Keep, och som INTE nyss tagits bort
-            # Deduplicated: duplicate ICA rows used to each add their own Keep
-            # item, which the push then mirrored back as more ICA rows.
-            to_add = []
-            for item in ica_items:
-                key = item.lower()
-                if key not in keep_lower and key not in recent_removes:
-                    _LOGGER.debug("➕ Planerar att lägga till i Keep: %s", item)
-                    to_add.append(item)
-                    keep_lower.append(key)
-                else:
-                    _LOGGER.debug("⛔ Hoppar över '%s' – finns i recent_removes eller redan i Keep", item)
-
-            
-            max_add = MAX_ICA_ITEMS - len(keep_items)
-            to_add = to_add[:max_add]
-
-            for item in to_add:
-                await hass.services.async_call(
-                    "todo", "add_item",
-                    {"entity_id": keep_entity, "item": item}
-                )
-                _LOGGER.info("✅ Lagt till '%s' i Keep", item)
-
-            # 3️⃣ Lägg till i ICA det som finns aktivt i Keep men saknas i ICA
-            # (t.ex. varor tillagda i Keep medan sessionen var utgången, som
-            # den vanliga debounce-synken aldrig lyckades pusha vidare).
-            # known_ica_items utesluts här: om varan tidigare bekräftats finnas
-            # i ICA och nu saknas betyder det att den bockats av/tagits bort i
-            # ICA (t.ex. skannad i kassan) – då ska den INTE återskapas i ICA,
-            # bara tas bort ur Keep (se to_remove_from_keep nedan).
-            to_push_to_ica = []
-            queued = set()
-            for s in keep_summaries:
-                key = s.strip().lower()
-                if (
-                    key not in keep_completed
-                    and key not in ica_items_lower
-                    and key not in recent_removes
-                    and key not in known_ica_items
-                    and key not in removed_in_ica
-                    and key not in queued
-                ):
-                    queued.add(key)
-                    to_push_to_ica.append(s)
-            space = MAX_ICA_ITEMS - len(rows)
-            to_push_to_ica = to_push_to_ica[:max(space, 0)]
-
-            for text in to_push_to_ica:
-                success = await api.add_to_list(list_id, text)
-                if success:
-                    _LOGGER.info("📤 (refresh) Lade till '%s' i ICA", text)
-
-            # Ta bort från Keep det som inte finns i ICA – men bara om vi
-            # tidigare bekräftat att varan faktiskt fanns i ICA (known_ica_items).
-            # Annars kan en vara som lagts till i Keep men ännu inte hunnit
-            # synkas till ICA (t.ex. under en utgången session) felaktigt tolkas
-            # som borttagen i ICA och raderas ur Keep. Vid osäkerhet: behåll.
-            to_remove_from_keep = [
-                i for i in keep_items
-                if i.get("summary", "").strip().lower() not in ica_items_lower
-                and (
-                    i.get("summary", "").strip().lower() in known_ica_items
-                    or i.get("summary", "").strip().lower() in removed_in_ica
-                )
-            ]
-
-            for i in to_remove_from_keep:
-                target = i.get("uid") or i.get("summary", "").strip()
-                if target and await _remove_from_keep(keep_entity, target):
-                    _LOGGER.info("🗑️ Tagit bort '%s' från Keep", i.get("summary", ""))
-
-            # Ta bort från ICA om det just tagits bort i Keep
-            to_remove_from_ica = [item for item in recent_removes if item in ica_rows_dict]
-
-            for text in to_remove_from_ica:
-                row_id = ica_rows_dict.get(text)
-                if row_id:
-                    await api.remove_item(row_id)
-                    _LOGGER.info("❌ Tog bort '%s' från ICA (baserat på Keep-radering)", text)
-
-            # Uppdatera sensor
-            await _trigger_sensor_update(hass, list_id)
-
-            # Spara ny baseline: hämta det faktiska ICA-läget efter alla
-            # ändringar ovan, så nästa refresh kan skilja på en riktig
-            # borttagning i ICA och en vara som bara inte synkats än.
-            final_lists = await api.fetch_lists()
-            final_list = next((l for l in final_lists if l.get("id") == list_id), None)
-            if final_list:
-                final_ica_set = {
-                    r.get("text", "").strip().lower()
-                    for r in final_list.get("rows", [])
-                    if isinstance(r, dict)
-                }
-                await baseline_store.async_save(list(final_ica_set))
-
-            # Rensa eventspårning efter allt är klart
-            if "recent_keep_adds" in hass.data[DOMAIN]:
-                hass.data[DOMAIN]["recent_keep_adds"].clear()
-            if "recent_keep_removes" in hass.data[DOMAIN]:
-                hass.data[DOMAIN]["recent_keep_removes"].clear()
-
-
-        except Exception as e:
-            _LOGGER.error("💥 Fel vid refresh: %s", e)
-
-
-    async def _remove_from_keep(keep_entity, target):
-        # One item already gone from Keep (e.g. removed by Keep's own sync)
-        # used to abort the whole refresh, skipping the baseline save.
-        try:
-            await hass.services.async_call(
-                "todo", "remove_item",
-                {"entity_id": keep_entity, "item": target},
-                blocking=True,
-            )
-            return True
-        except Exception as e:
-            _LOGGER.warning("⚠️ Kunde inte ta bort '%s' från Keep: %s", target, e)
-            return False
-
-    hass.services.async_register(DOMAIN, "refresh", handle_refresh)
-
-    # --- Ladda sensorer (korrekt sätt) ---
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
-
-    # --- Reload vid options-ändring ---
-    entry.async_on_unload(entry.add_update_listener(_options_update_listener))
-
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    sync.async_start()
+    entry.async_on_unload(sync.async_stop)
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 
-async def async_unload_entry(hass, entry):
-    return await hass.config_entries.async_unload_platforms(entry, ["sensor"])
 
-async def _options_update_listener(hass, entry):
-    _LOGGER.debug("♻️ Optioner har ändrats, laddar om entry")
+async def async_unload_entry(hass: HomeAssistant, entry) -> bool:
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    prev_list_id = hass.data[DOMAIN].get("current_list_id")
-    new_list_id = entry.options.get("ica_list_id", entry.data.get("ica_list_id"))
 
-    if prev_list_id and prev_list_id != new_list_id:
-        _LOGGER.warning("⚠️ List ID changed from %s to %s – this may cause syncing of previous Keep items to the new ICA list.", prev_list_id, new_list_id)
-
-    hass.data[DOMAIN]["current_list_id"] = new_list_id
-
+async def _async_options_updated(hass: HomeAssistant, entry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+class ICASync:
+    """Keeps one ICA list in line with one to-do list."""
+
+    def __init__(self, hass: HomeAssistant, entry, api: ICAApi, keep_entity_id: str) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.api = api
+        self.keep_entity_id = keep_entity_id
+        self.list_id = entry.options.get("ica_list_id", entry.data["ica_list_id"])
+        self.remove_struck = entry.options.get("remove_striked", entry.data.get("remove_striked", True))
+
+        self._store = Store(hass, STORAGE_VERSION, f"{LINKS_STORAGE_KEY}_{entry.entry_id}_{self.list_id}")
+        # to-do uid -> {"row_id": ICA row id, "text": text last pushed to ICA}
+        self._links: dict[str, dict] | None = None
+        # ICA row id -> {"text": lowercased text, "since": epoch} for rows
+        # added in the ICA app and copied to the to-do list, awaiting the uid.
+        self._pending: dict[str, dict] = {}
+
+        self._lock = asyncio.Lock()
+        # Not helpers.debounce.Debouncer: it drops a call that comes due while
+        # the previous one is still running ("any call is good"), but a sync
+        # reads the to-do list when it starts, so items added mid-sync were
+        # missed. A plain timer that queues on the lock always gets a fresh run.
+        self._unsub_debounce = None
+        self._unsubs: list = []
+        self._unsub_items = None
+        self._subscribed_entity = None
+        self._last_signature = None
+
+    # --- triggers -----------------------------------------------------------
+
+    @callback
+    def async_start(self) -> None:
+        # Item-level updates (incl. renames, which don't change the entity's
+        # state) come from the to-do entity's subscription; the state listener
+        # re-subscribes when the to-do integration reloads its entity.
+        self._unsubs.append(
+            async_track_state_change_event(self.hass, [self.keep_entity_id], self._async_keep_state_changed)
+        )
+        self._unsubs.append(async_track_time_interval(self.hass, self._async_interval, SYNC_INTERVAL))
+        self._unsubs.append(async_at_started(self.hass, self._async_hass_started))
+
+    @callback
+    def async_stop(self) -> None:
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs.clear()
+        if self._unsub_items:
+            self._unsub_items()
+            self._unsub_items = None
+        self._subscribed_entity = None
+        if self._unsub_debounce:
+            self._unsub_debounce()
+            self._unsub_debounce = None
+
+    async def _async_hass_started(self, _hass) -> None:
+        self._async_attach()
+        await self.async_reconcile()
+
+    async def _async_interval(self, _now) -> None:
+        await self.async_reconcile()
+
+    async def _async_debounced(self, _now) -> None:
+        self._unsub_debounce = None
+        await self.async_reconcile()
+
+    def _get_keep_entity(self):
+        component = self.hass.data.get(TODO_DATA_COMPONENT)
+        return component.get_entity(self.keep_entity_id) if component else None
+
+    @callback
+    def _async_attach(self) -> None:
+        entity = self._get_keep_entity()
+        if entity is self._subscribed_entity:
+            return
+        if self._unsub_items:
+            self._unsub_items()
+            self._unsub_items = None
+        self._subscribed_entity = entity
+        if entity is not None:
+            self._unsub_items = entity.async_subscribe_updates(self._async_items_updated)
+
+    @callback
+    def _async_keep_state_changed(self, event: Event[EventStateChangedData]) -> None:
+        self._async_attach()
+        entity = self._subscribed_entity
+        self._async_items_updated(entity.todo_items if entity else None)
+
+    @callback
+    def _async_items_updated(self, items) -> None:
+        # Called on every write of the to-do entity, including polls that
+        # changed nothing; only an actual change to the items triggers a sync.
+        signature = (
+            None
+            if items is None
+            else tuple(sorted((i.uid or "", i.summary or "", str(i.status)) for i in items))
+        )
+        if signature == self._last_signature:
+            return
+        self._last_signature = signature
+        if self._unsub_debounce:
+            self._unsub_debounce()
+        self._unsub_debounce = async_call_later(self.hass, DEBOUNCE_SECONDS, self._async_debounced)
+
+    # --- reconcile ----------------------------------------------------------
+
+    async def async_reconcile(self, raise_errors: bool = False) -> None:
+        async with self._lock:
+            try:
+                await self._async_reconcile()
+            except (ICAError, HomeAssistantError) as err:
+                if raise_errors:
+                    raise HomeAssistantError(f"ICA sync failed: {err}") from err
+                _LOGGER.warning("ICA sync skipped: %s", err)
+            except Exception:
+                if raise_errors:
+                    raise
+                _LOGGER.exception("ICA sync failed")
+
+    def _keep_items(self) -> dict:
+        self._async_attach()
+        entity = self._subscribed_entity
+        state = self.hass.states.get(self.keep_entity_id)
+        items = entity.todo_items if entity else None
+        if items is None or state is None or state.state in ("unavailable", "unknown"):
+            # Unknown is not empty: syncing against it would delete every row.
+            raise HomeAssistantError(f"{self.keep_entity_id} is not available")
+        return {i.uid: i for i in items if i.uid}
+
+    async def _async_reconcile(self) -> None:
+        ica_list = await self.api.async_get_list(self.list_id)
+        rows = {r["id"]: r for r in ica_list.get("rows") or [] if isinstance(r, dict) and r.get("id")}
+        keep = self._keep_items()
+        links = await self._async_load_links(keep, rows)
+
+        # Guards against a glitch on either side wiping the other. Scanning at
+        # the checkout strikes rows one by one and the to-do list empties item
+        # by item, so a whole side vanishing at once with several links still
+        # in place is treated as suspect, never as "everything bought/deleted".
+        # A single last item going is normal (e.g. deleting the one misheard
+        # item left on the list) and is synced as usual.
+        if len(links) >= WIPE_GUARD_MIN_LINKS and not keep:
+            # Wait: the next non-empty to-do list resolves it either way
+            # (items still missing then are deleted from ICA as usual).
+            _LOGGER.warning("%s is empty but %s items are linked; not syncing", self.keep_entity_id, len(links))
+            return
+        if len(links) >= WIPE_GUARD_MIN_LINKS and not rows:
+            # Re-push the to-do list rather than clearing it.
+            _LOGGER.warning("ICA list is empty but %s items are linked; re-adding them", len(links))
+            links.clear()
+            await self._async_save()
+
+        # 1. Linked pairs: did either side change? A pair that is settled here
+        # leaves `keep` too, or step 2 would see its to-do item (read before
+        # it was removed) as new and push it straight back into ICA.
+        for uid, link in list(links.items()):
+            row = rows.get(link["row_id"])
+            item = keep.get(uid)
+
+            if row is None or row.get("isStriked"):
+                # Struck off at the checkout (or deleted in ICA): bought.
+                if row is not None and self.remove_struck:
+                    await self.api.async_delete_row(row["id"])
+                    del rows[row["id"]]
+                if item is not None:
+                    await self._async_finish_keep_item(item)
+                    _LOGGER.info("Bought in ICA, cleared from to-do list: %s", item.summary)
+                del links[uid]
+                keep.pop(uid, None)
+                await self._async_save()
+                continue
+
+            if item is None or item.status == TodoItemStatus.COMPLETED:
+                # Deleted or ticked off in the to-do list, e.g. a misheard
+                # item removed on the Nest Hub.
+                await self.api.async_delete_row(row["id"])
+                del rows[row["id"]]
+                if item is not None and self.remove_struck:
+                    await self._async_remove_keep_item(uid)
+                _LOGGER.info("Removed from to-do list, deleted from ICA: %s", link["text"])
+                del links[uid]
+                keep.pop(uid, None)
+                await self._async_save()
+                continue
+
+            text = (item.summary or "").strip()
+            if text and text != link["text"]:
+                # Renamed in the to-do list (e.g. fixing a misheard word).
+                rows[row["id"]] = await self.api.async_update_row(row, text)
+                _LOGGER.info("Renamed in ICA: %s -> %s", link["text"], text)
+                link["text"] = text
+                await self._async_save()
+
+        # 2. To-do items with no ICA row yet.
+        for uid, item in keep.items():
+            if uid in links:
+                continue
+            if item.status == TodoItemStatus.COMPLETED:
+                if self.remove_struck:
+                    await self._async_remove_keep_item(uid)
+                continue
+            text = (item.summary or "").strip()
+            if not text:
+                continue
+            row_id = self._claim_pending(text, rows)
+            if row_id is None:
+                if len(rows) >= MAX_ICA_ROWS:
+                    _LOGGER.error("ICA list is full (%s rows); not adding more", len(rows))
+                    break
+                row = await self.api.async_add_row(self.list_id, text)
+                rows[row["id"]] = row
+                row_id = row["id"]
+                _LOGGER.info("Added to ICA: %s", text)
+            links[uid] = {"row_id": row_id, "text": text}
+            await self._async_save()
+
+        # 3. ICA rows not linked to any to-do item.
+        linked_rows = {link["row_id"] for link in links.values()}
+        linked_texts = {link["text"].lower() for link in links.values()}
+        self._pending = {rid: p for rid, p in self._pending.items() if rid in rows}
+        for row_id, row in list(rows.items()):
+            if row_id in linked_rows or row_id in self._pending:
+                continue
+            text = (row.get("text") or "").strip()
+            if row.get("isStriked"):
+                if self.remove_struck:
+                    await self.api.async_delete_row(row_id)
+                    del rows[row_id]
+                continue
+            if not text or text.lower() in linked_texts:
+                # A duplicate of a linked row, left behind by older versions.
+                await self.api.async_delete_row(row_id)
+                del rows[row_id]
+                _LOGGER.info("Deleted duplicate ICA row: %s", text)
+                continue
+            # Added in the ICA app: copy it to the to-do list. The to-do
+            # service doesn't return the new uid, so the row is linked when
+            # the item appears (step 2, via _claim_pending).
+            self._pending[row_id] = {"text": text.lower(), "since": time.time()}
+            linked_texts.add(text.lower())
+            await self._async_save()
+            await self.hass.services.async_call(
+                "todo", "add_item", {"entity_id": self.keep_entity_id, "item": text}, blocking=True
+            )
+            _LOGGER.info("Added in ICA, copied to to-do list: %s", text)
+
+        async_dispatcher_send(
+            self.hass, signal_list_updated(self.entry.entry_id), {**ica_list, "rows": list(rows.values())}
+        )
+
+    def _claim_pending(self, text: str, rows: dict) -> str | None:
+        key = text.lower()
+        now = time.time()
+        for row_id, pending in list(self._pending.items()):
+            if now - pending["since"] > PENDING_ADOPTION_TIMEOUT:
+                del self._pending[row_id]
+            elif pending["text"] == key and row_id in rows:
+                del self._pending[row_id]
+                return row_id
+        return None
+
+    async def _async_finish_keep_item(self, item) -> None:
+        if self.remove_struck:
+            await self._async_remove_keep_item(item.uid)
+        elif item.status != TodoItemStatus.COMPLETED:
+            await self.hass.services.async_call(
+                "todo",
+                "update_item",
+                {"entity_id": self.keep_entity_id, "item": item.uid, "status": "completed"},
+                blocking=True,
+            )
+
+    async def _async_remove_keep_item(self, uid: str) -> None:
+        try:
+            await self.hass.services.async_call(
+                "todo", "remove_item", {"entity_id": self.keep_entity_id, "item": [uid]}, blocking=True
+            )
+        except HomeAssistantError as err:
+            # Already gone (e.g. removed by the to-do list's own sync).
+            _LOGGER.debug("Could not remove %s from %s: %s", uid, self.keep_entity_id, err)
+
+    # --- persistence --------------------------------------------------------
+
+    async def _async_load_links(self, keep: dict, rows: dict) -> dict:
+        if self._links is not None:
+            return self._links
+
+        data = await self._store.async_load()
+        if data is not None:
+            self._links = data.get("links", {})
+            self._pending = data.get("pending", {})
+            return self._links
+
+        # First run (fresh install or upgrade from the name-based versions):
+        # pair existing to-do items with ICA rows by name, one to one. This is
+        # the only place items are matched by name.
+        by_text = defaultdict(list)
+        for row in rows.values():
+            by_text[(row.get("text") or "").strip().lower()].append(row["id"])
+        self._links = {}
+        for uid, item in keep.items():
+            text = (item.summary or "").strip()
+            if text and by_text.get(text.lower()):
+                self._links[uid] = {"row_id": by_text[text.lower()].pop(0), "text": text}
+        _LOGGER.info("Linked %s existing to-do items to ICA rows by name", len(self._links))
+        await self._async_save()
+        await Store(
+            self.hass, STORAGE_VERSION, f"{OLD_BASELINE_STORAGE_KEY}_{self.entry.entry_id}_{self.list_id}"
+        ).async_remove()
+        return self._links
+
+    async def _async_save(self) -> None:
+        await self._store.async_save({"links": self._links, "pending": self._pending})

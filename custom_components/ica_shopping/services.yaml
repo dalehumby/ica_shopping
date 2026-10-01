@@ -1,9 +1,5 @@
-add_item:
-  description: "Add item to ICA shopping list"
-  fields:
-    list_id:
-      description: "ID of the shopping list"
-      example: "97c9c669-91fd-4b08-84de-de14314d44ge"
-    text:
-      description: "Item text to add, e.g. 'kaffe'"
-      example: "kaffe"
+refresh:
+  name: Refresh
+  description: >-
+    Sync the ICA list with the to-do list now: rows struck off in ICA are
+    removed from the to-do list, and to-do changes are pushed to ICA.
